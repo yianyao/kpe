@@ -1,6 +1,6 @@
 [project]
 name = "kpe"
-version = "0.1.0"
+version = "0.2.0"
 description = "Extract self-contained knowledge points from long books (PDF/Markdown/plain text)"
 readme = "README.md"
 license = { text = "MIT" }

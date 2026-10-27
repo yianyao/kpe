@@ -14,7 +14,8 @@ from .chunk import (Chunk, markdown_sections, merge_split, window_sections)
 from .llm import LLMClient, LLMConfig, key_from_env
 from .pdf import (build_sections, clean_pages, detect_offset, parse_toc,
                   read_pages)
-from .prompt import SYSTEM, build_user
+from .prompt import (DEFAULT_MAX_POINTS, SYSTEM, build_system, build_user,
+                     clamp_max_points)
 from .review import render_review
 from .store import append_jsonl, read_json, read_jsonl, sha1, write_json, write_jsonl
 from .validate import dedupe, gate_reasons, parse_points, quote_ok
@@ -80,7 +81,8 @@ def cmd_chunks(args: argparse.Namespace) -> int:
 
 
 def _extract_one(client: LLMClient, chunk: dict, book: str, total: int,
-                 cache_dir: Path, retry_failed: bool) -> dict:
+                 cache_dir: Path, retry_failed: bool,
+                 system: str = SYSTEM) -> dict:
     cid = chunk["id"]
     cache_path = cache_dir / f"{cid}.json"
     cached = read_json(cache_path)
@@ -91,7 +93,7 @@ def _extract_one(client: LLMClient, chunk: dict, book: str, total: int,
     user = build_user(book, chunk["section_path"], chunk["page_start"],
                       chunk["page_end"], chunk["index"], total, chunk["text"])
     try:
-        content, usage = client.chat(SYSTEM, user)
+        content, usage = client.chat(system, user)
         row = {"chunk_id": cid, "content": content, "usage": usage,
                "error": "", "model": client.cfg.model, "ts": _now()}
     except Exception as exc:  # noqa: BLE001
@@ -104,10 +106,11 @@ def _extract_one(client: LLMClient, chunk: dict, book: str, total: int,
 
 
 def _repair(client: LLMClient, chunk: dict, book: str, total: int,
-            prev_user: str, err: str, cache_dir: Path) -> tuple[str, dict]:
+            prev_user: str, err: str, cache_dir: Path,
+            system: str = SYSTEM) -> tuple[str, dict]:
     user = (f"{prev_user}\n\n上次输出无法解析为 JSON（{err}）。"
             "请重新输出，只输出合法 JSON，不要解释。")
-    content, usage = client.chat(SYSTEM, user)
+    content, usage = client.chat(system, user)
     write_json(cache_dir / f"{chunk['id']}.repair.json",
                {"chunk_id": chunk["id"], "content": content, "usage": usage,
                 "ts": _now()})
@@ -141,17 +144,20 @@ def cmd_extract(args: argparse.Namespace) -> int:
         thinking=args.thinking, max_tokens=args.max_tokens))
     points_path = out / "points.jsonl"
     rejected_path = out / "rejected.jsonl"
+    max_points = clamp_max_points(getattr(args, "max_points", DEFAULT_MAX_POINTS))
+    system = build_system(max_points)
     stats = {"chunks": len(chunks), "done": 0, "cached": 0, "failed": 0,
              "points": 0, "rejected": 0, "dup": 0, "quote_ok": 0,
              "tokens_in": 0, "tokens_out": 0, "model": args.model,
-             "started_at": _now()}
+             "max_points": max_points, "started_at": _now()}
     seen: set[str] = set()
     for p in read_jsonl(points_path):
         seen.add(sha1("".join(str(p.get("text") or "").split())))
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {pool.submit(_extract_one, client, c, manifest["book"],
-                               len(chunks), cache_dir, args.retry_failed): c
+                               len(chunks), cache_dir, args.retry_failed,
+                               system): c
                    for c in chunks}
         for fut in as_completed(futures):
             res = fut.result()
@@ -172,7 +178,8 @@ def cmd_extract(args: argparse.Namespace) -> int:
                                       chunk["page_start"], chunk["page_end"],
                                       chunk["index"], len(chunks), chunk["text"])
                     content, usage2 = _repair(client, chunk, manifest["book"],
-                                              len(chunks), user, err, cache_dir)
+                                              len(chunks), user, err, cache_dir,
+                                              system)
                     stats["tokens_in"] += int(usage2.get("prompt_tokens") or 0)
                     stats["tokens_out"] += int(usage2.get("completion_tokens") or 0)
                     pts, err = parse_points(content)
@@ -204,7 +211,7 @@ def cmd_extract(args: argparse.Namespace) -> int:
                              "text": text, "quote": quote,
                              "quote_ok": qok, "model": args.model})
                 stats["quote_ok"] += 1 if qok else 0
-            for p in kept:
+            for p in kept[:max_points]:
                 append_jsonl(points_path, p)
                 stats["points"] += 1
             append_jsonl(done_path, {"chunk_id": chunk["id"], "ts": _now()})
@@ -307,6 +314,8 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--max-tokens", type=int, default=0)
     e.add_argument("--workers", type=int, default=4)
     e.add_argument("--limit", type=int, default=0)
+    e.add_argument("--max-points", type=int, default=DEFAULT_MAX_POINTS,
+                   help="每块最多抽几个点（默认 6，上限 20；同时改写 prompt 与截断）")
     e.add_argument("--chapter", action="append", default=[],
                    help="只跑 section_path 含该子串的块，可多次")
     e.add_argument("--retry-failed", action="store_true")
